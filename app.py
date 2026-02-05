@@ -1,211 +1,247 @@
 import streamlit as st
-import pandas as pd
 import requests
-import time
+import pandas as pd
+import plotly.express as px
 from datetime import datetime
-import io
+from io import BytesIO
 
-# --------------------------------------------------------------------------
-# 1. 페이지 설정
-# --------------------------------------------------------------------------
+# --------------------------------------------------
+# Page Config
+# --------------------------------------------------
 st.set_page_config(
-    page_title="Janytree 통합 운영 대시보드 (정밀모드)",
-    page_icon="📦",
+    page_title="Janytree Operations Dashboard",
     layout="wide"
 )
 
-# --------------------------------------------------------------------------
-# 2. 사이드바
-# --------------------------------------------------------------------------
-st.sidebar.header("🔒 API 인증")
-api_key = st.sidebar.text_input("API Key 입력", type="password")
-secret_key = st.sidebar.text_input("Secret Key 입력", type="password")
+st.title("🌿 Janytree Operations Dashboard")
 
-st.sidebar.markdown("---")
-st.sidebar.header("📅 기간 설정")
-start_date = st.sidebar.date_input("시작일", datetime(2026, 1, 1))
-end_date = st.sidebar.date_input("종료일", datetime.now())
+# --------------------------------------------------
+# Utils
+# --------------------------------------------------
+def unix_to_dt(ts):
+    if ts:
+        return datetime.fromtimestamp(int(ts))
+    return None
 
-# 데이터 불러오기 버튼
-if st.sidebar.button("🔄 데이터 불러오기 (정밀 조회)", type="primary"):
-    if not api_key or not secret_key:
-        st.sidebar.error("API Key와 Secret Key를 입력해주세요.")
-    else:
-        status_box = st.empty()
-        progress_bar = st.progress(0)
-        
+
+def safe_get(d, key, default=None):
+    return d.get(key, default) if isinstance(d, dict) else default
+
+
+# --------------------------------------------------
+# Imweb API
+# --------------------------------------------------
+IMWEB_AUTH_URL = "https://api.imweb.me/v2/auth"
+IMWEB_PROD_ORDERS_URL = "https://api.imweb.me/v2/shop/prod-orders"
+
+
+def get_access_token(key, secret):
+    res = requests.post(
+        IMWEB_AUTH_URL,
+        json={"key": key, "secret": secret},
+        timeout=10
+    )
+    res.raise_for_status()
+    return res.json()["data"]["access_token"]
+
+
+def fetch_prod_orders(token, start_ts, end_ts, progress_bar):
+    headers = {"Authorization": f"Bearer {token}"}
+    page = 1
+    all_items = []
+
+    while True:
+        params = {
+            "page": page,
+            "limit": 100,
+            "start_time": start_ts,
+            "end_time": end_ts,
+        }
+
+        r = requests.get(
+            IMWEB_PROD_ORDERS_URL,
+            headers=headers,
+            params=params,
+            timeout=20
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+
+        if not data:
+            break
+
+        all_items.extend(data)
+        page += 1
+        progress_bar.progress(min(page * 5, 100))
+
+    return all_items
+
+
+# --------------------------------------------------
+# Sidebar
+# --------------------------------------------------
+with st.sidebar:
+    st.header("🔑 API 설정")
+
+    api_key = st.text_input("Imweb API Key", type="password")
+    api_secret = st.text_input("Imweb Secret Key", type="password")
+
+    st.divider()
+
+    st.header("📅 기간 선택")
+    start_date = st.date_input("시작일")
+    end_date = st.date_input("종료일")
+
+    fetch_btn = st.button("📥 데이터 불러오기")
+
+
+# --------------------------------------------------
+# Data Load
+# --------------------------------------------------
+df = pd.DataFrame()
+
+if fetch_btn:
+    if not api_key or not api_secret:
+        st.error("API Key와 Secret을 입력하세요.")
+        st.stop()
+
+    with st.spinner("Imweb API 인증 중..."):
         try:
-            # [1] 로그인
-            status_box.info("🔑 로그인 시도 중...")
-            auth_res = requests.post("https://api.imweb.me/v2/auth", json={"key": api_key, "secret": secret_key})
-            
-            if auth_res.status_code != 200:
-                st.error(f"로그인 실패! (코드: {auth_res.status_code})")
-                st.stop()
-            
-            access_token = auth_res.json().get('access_token')
-            headers = {"access-token": access_token}
-            
-            # [2] 주문 목록(껍데기) 가져오기
-            status_box.info("📂 주문 목록을 확보하는 중...")
-            
-            # 최신 100건만 먼저 조회 (속도 고려)
-            params_orders = {"limit": 100} 
-            res_orders = requests.get("https://api.imweb.me/v2/shop/orders", headers=headers, params=params_orders)
-            
-            if res_orders.status_code != 200:
-                st.error("주문 목록 조회 실패")
-                st.stop()
-
-            raw_orders = res_orders.json().get('data', {}).get('list', [])
-            
-            if not raw_orders:
-                st.warning("기간 내 주문이 없습니다.")
-                st.stop()
-                
-            # [3] 하나씩 순회하며 '상품' 정밀 조회 (Hybrid Fetching)
-            clean_data = []
-            total_count = len(raw_orders)
-            
-            for i, order in enumerate(raw_orders):
-                # 진행률 업데이트
-                progress_bar.progress((i + 1) / total_count)
-                status_box.info(f"🔎 ({i+1}/{total_count}) 주문번호 {order['order_no']} 상품 찾는 중...")
-                
-                # 날짜 필터링
-                ts = order.get('order_time', 0)
-                order_dt = datetime.fromtimestamp(ts)
-                order_date_str = order_dt.strftime('%Y-%m-%d')
-                
-                if not (start_date <= order_dt.date() <= end_date):
-                    continue
-                
-                # 배송지 정보 미리 확보
-                delivery = order.get('delivery', {})
-                addr = delivery.get('address', {})
-                orderer = order.get('orderer', {})
-                
-                # --- [핵심] prod-orders에 '주문번호'를 넣어서 직접 물어보기 ---
-                # "이 주문번호에 해당하는 상품 내놔!"
-                p_res = requests.get(
-                    "https://api.imweb.me/v2/shop/prod-orders", 
-                    headers=headers, 
-                    params={"order_no": order['order_no']} # 주문번호 지정 조회
-                )
-                
-                items_found = []
-                if p_res.status_code == 200:
-                    items_found = p_res.json().get('data', {}).get('list', [])
-                
-                # 만약 prod-orders에도 없으면? 원래 items(order 안의) 확인
-                if not items_found:
-                    items_found = order.get('items', [])
-                
-                # 상태 한글 변환
-                status_map = {
-                    "PAY_WAIT": "입금대기", "PAYMENT": "결제완료", "PREPARE": "배송준비", 
-                    "DELIV_WAIT": "배송대기", "DELIV_ING": "배송중", "DELIV_COMP": "배송완료",
-                    "CANCEL": "취소", "EXCHANGE": "교환", "RETURN": "반품", "CONFIRM": "구매확정"
-                }
-                
-                # 상품 정보가 드디어 있다면!
-                if items_found:
-                    for item in items_found:
-                        raw_status = item.get('status', order.get('status', 'UNKNOWN'))
-                        
-                        clean_data.append({
-                            "주문번호": order['order_no'],
-                            "주문상태": status_map.get(raw_status, raw_status),
-                            "주문일자": order_date_str,
-                            "상품명": item.get('prod_name', item.get('name', '상품명확인불가')), # 여기서 확보!
-                            "옵션명": item.get('options_str', item.get('option_name', '-')),
-                            "수량": int(float(item.get('ea', 1))),
-                            "결제금액": float(item.get('payment_price', item.get('price_total', 0))),
-                            "주문자": orderer.get('name', '-'),
-                            "수령인": addr.get('name', '-'),
-                            "연락처": addr.get('phone', '-'),
-                            "주소": f"{addr.get('address', '')} {addr.get('address_detail', '')}",
-                            "우편번호": addr.get('postcode', '-'),
-                            "배송메시지": addr.get('memo', '-')
-                        })
-                else:
-                    # 끝까지 상품이 안 나오면 '정보없음'으로라도 기록 (누락 방지)
-                    clean_data.append({
-                        "주문번호": order['order_no'],
-                        "주문상태": status_map.get(order.get('status'), order.get('status')),
-                        "주문일자": order_date_str,
-                        "상품명": "⚠️상품정보 없음(API누락)",
-                        "옵션명": "-", "수량": 1, "결제금액": 0,
-                        "주문자": orderer.get('name'), "수령인": addr.get('name'),
-                        "연락처": addr.get('phone'), "주소": addr.get('address'),
-                        "우편번호": addr.get('postcode'), "배송메시지": "-"
-                    })
-
-            # 결과 저장
-            st.session_state['df'] = pd.DataFrame(clean_data)
-            status_box.success(f"✅ 완료! 총 {len(clean_data)}개의 상품 데이터를 찾았습니다.")
-            progress_bar.empty()
-            time.sleep(1)
-            st.rerun()
-
+            token = get_access_token(api_key, api_secret)
         except Exception as e:
-            st.error(f"오류 발생: {e}")
+            st.error(f"인증 실패: {e}")
+            st.stop()
 
-# --------------------------------------------------------------------------
-# 3. 메인 콘텐츠
-# --------------------------------------------------------------------------
-st.title("Janytree 통합 운영 대시보드")
+    start_ts = int(datetime.combine(start_date, datetime.min.time()).timestamp())
+    end_ts = int(datetime.combine(end_date, datetime.max.time()).timestamp())
 
-if 'df' in st.session_state and not st.session_state['df'].empty:
-    df = st.session_state['df']
-    
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 매출", "📄 송장", "📦 공구", "💎 재고", "👥 고객", "🔌 원본"
-    ])
+    progress = st.progress(0)
 
-    # [Tab 1] 매출
+    try:
+        raw = fetch_prod_orders(token, start_ts, end_ts, progress)
+    except Exception as e:
+        st.error(f"주문 데이터 조회 실패: {e}")
+        st.stop()
+
+    if not raw:
+        st.warning("선택한 기간에 주문 데이터가 없습니다.")
+        st.stop()
+
+    rows = []
+    for r in raw:
+        rows.append({
+            "order_no": safe_get(r, "order_no"),
+            "order_date": unix_to_dt(safe_get(r, "order_time") or safe_get(r, "pay_time")),
+            "status": safe_get(r, "status"),
+            "buyer": safe_get(r, "orderer_name"),
+            "receiver": safe_get(r, "receiver_name"),
+            "phone": safe_get(r, "receiver_phone"),
+            "address": safe_get(r, "receiver_addr"),
+            "product": safe_get(r, "prod_name"),
+            "option": safe_get(r, "options_str"),
+            "qty": int(safe_get(r, "ea", 0)),
+            "price": int(safe_get(r, "payment_price", 0)),
+        })
+
+    df = pd.DataFrame(rows)
+
+# --------------------------------------------------
+# Tabs
+# --------------------------------------------------
+if not df.empty:
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📊 Sales", "🧾 Invoice", "🔍 Gong-gu", "📦 Inventory", "🧪 Raw Data"]
+    )
+
+    # --------------------------------------------------
+    # Tab 1: Sales Dashboard
+    # --------------------------------------------------
     with tab1:
-        c1, c2 = st.columns(2)
-        c1.metric("총 매출액", f"₩{df['결제금액'].sum():,.0f}")
-        c2.metric("총 판매 수량", f"{df['수량'].sum()}개")
-        st.bar_chart(df.groupby('주문일자')['결제금액'].sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("총 매출", f"{df['price'].sum():,} 원")
+        c2.metric("총 판매 수량", df["qty"].sum())
+        c3.metric("주문 건수", df["order_no"].nunique())
 
-    # [Tab 2] 송장
+        daily = df.groupby(df["order_date"].dt.date)["price"].sum().reset_index()
+        st.plotly_chart(
+            px.line(daily, x="order_date", y="price", title="일별 매출"),
+            use_container_width=True
+        )
+
+        top_prod = (
+            df.groupby("product")["qty"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+        )
+        st.plotly_chart(
+            px.bar(top_prod, x="product", y="qty", title="TOP 상품"),
+            use_container_width=True
+        )
+
+    # --------------------------------------------------
+    # Tab 2: Invoice Generator
+    # --------------------------------------------------
     with tab2:
-        st.subheader("송장 생성기")
-        target_stats = st.multiselect("상태 선택", df['주문상태'].unique(), default=df['주문상태'].unique())
-        
-        if st.button("🚀 송장 변환"):
-            tdf = df[df['주문상태'].isin(target_stats)]
-            if tdf.empty:
-                st.warning("주문이 없습니다.")
-            else:
-                rows = []
-                for no, g in tdf.groupby('주문번호'):
-                    opts = []
-                    for _, r in g.iterrows():
-                        q = int(r['수량'])
-                        for _ in range(q): opts.append(f"[{r['상품명']}] {r['옵션명']}")
-                    opts.sort()
-                    f = g.iloc[0]
-                    rows.append({
-                        "주문번호": f['주문번호'], "상태": f['주문상태'], "수령인": f['수령인'],
-                        "합포장내역": " // ".join(opts), "총수량": len(opts),
-                        "주소": f['주소'], "연락처": f['연락처'], "우편번호": f['우편번호']
-                    })
-                res_df = pd.DataFrame(rows)
-                st.dataframe(res_df)
-                
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    res_df.to_excel(writer, index=False)
-                st.download_button("📥 엑셀 다운로드", output.getvalue(), "송장.xlsx")
+        def merge_products(sub):
+            result = []
+            for _, row in sub.iterrows():
+                name = row["product"]
+                if row["option"]:
+                    name = f"{name} ({row['option']})"
+                result.extend([name] * row["qty"])
+            return " // ".join(result)
 
-    # [Tab 3~6] (간략화)
-    with tab3: st.dataframe(df)
-    with tab4: st.dataframe(df.groupby(['상품명', '옵션명'])['수량'].sum().sort_values(ascending=False))
-    with tab5: st.dataframe(df)
-    with tab6: st.dataframe(df)
+        invoice_df = (
+            df.groupby("order_no")
+            .apply(lambda x: pd.Series({
+                "주문일": x["order_date"].iloc[0],
+                "수령인": x["receiver"].iloc[0],
+                "주소": x["address"].iloc[0],
+                "상품": merge_products(x),
+                "결제금액": x["price"].sum()
+            }))
+            .reset_index()
+        )
 
-else:
-    st.info("👈 왼쪽 사이드바에서 [데이터 불러오기]를 눌러주세요. (정밀 조회 모드로 작동합니다)")
+        st.dataframe(invoice_df, use_container_width=True)
+
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            invoice_df.to_excel(writer, index=False, sheet_name="Invoice")
+
+        st.download_button(
+            "📥 엑셀 다운로드",
+            data=buffer.getvalue(),
+            file_name="invoice.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    # --------------------------------------------------
+    # Tab 3: Group Buying Search
+    # --------------------------------------------------
+    with tab3:
+        keyword = st.text_input("상품명 키워드 검색")
+        if keyword:
+            filtered = df[df["product"].str.contains(keyword, case=False, na=False)]
+            st.metric("총 판매 수량", filtered["qty"].sum())
+            st.dataframe(filtered)
+
+    # --------------------------------------------------
+    # Tab 4: Inventory & Ranking
+    # --------------------------------------------------
+    with tab4:
+        inv = (
+            df.groupby(["product", "option"])["qty"]
+            .sum()
+            .reset_index()
+            .sort_values("qty", ascending=False)
+        )
+        st.dataframe(inv, use_container_width=True)
+
+    # --------------------------------------------------
+    # Tab 5: Raw Data
+    # --------------------------------------------------
+    with tab5:
+        st.dataframe(df, use_container_width=True)
